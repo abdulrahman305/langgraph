@@ -1,0 +1,3 @@
+[submodule "az-partner-center-cli"]
+	path = az-partner-center-cli
+	url = https://github.com/abdulrahman305/az-partner-center-cli.git
