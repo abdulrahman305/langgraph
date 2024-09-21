@@ -43,8 +43,27 @@ class NodeInterrupt(GraphInterrupt):
         super().__init__([Interrupt(value)])
 
 
+class GraphDelegate(Exception):
+    """Raised when a graph is delegated."""
+
+    def __init__(self, *args: dict[str, Any]) -> None:
+        super().__init__(*args)
+
+
 class EmptyInputError(Exception):
     """Raised when graph receives an empty input."""
+
+    pass
+
+
+class TaskNotFound(Exception):
+    """Raised when the executor is unable to find a task."""
+
+    pass
+
+
+class CheckpointNotLatest(Exception):
+    """Raised when the checkpoint is not the latest version."""
 
     pass
 

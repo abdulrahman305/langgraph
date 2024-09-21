@@ -2,7 +2,7 @@ import asyncio
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from typing import AsyncIterator, Iterator, Mapping, Optional, Union
 
-from langchain_core.runnables import RunnableConfig, patch_config
+from langchain_core.runnables import RunnableConfig
 
 from langgraph.channels.base import BaseChannel
 from langgraph.checkpoint.base import Checkpoint
@@ -14,6 +14,7 @@ from langgraph.managed.base import (
 )
 from langgraph.managed.context import Context
 from langgraph.store.base import BaseStore
+from langgraph.utils.config import patch_configurable
 
 
 @contextmanager
@@ -26,9 +27,9 @@ def ChannelsManager(
     skip_context: bool = False,
 ) -> Iterator[tuple[Mapping[str, BaseChannel], ManagedValueMapping]]:
     """Manage channels for the lifetime of a Pregel invocation (multiple steps)."""
-    config_for_managed = patch_config(config, configurable={CONFIG_KEY_STORE: store})
-    channel_specs: Mapping[str, BaseChannel] = {}
-    managed_specs: Mapping[str, ManagedValueSpec] = {}
+    config_for_managed = patch_configurable(config, {CONFIG_KEY_STORE: store})
+    channel_specs: dict[str, BaseChannel] = {}
+    managed_specs: dict[str, ManagedValueSpec] = {}
     for k, v in specs.items():
         if isinstance(v, BaseChannel):
             channel_specs[k] = v
@@ -41,9 +42,7 @@ def ChannelsManager(
     with ExitStack() as stack:
         yield (
             {
-                k: stack.enter_context(
-                    v.from_checkpoint_named(checkpoint["channel_values"].get(k), config)
-                )
+                k: v.from_checkpoint(checkpoint["channel_values"].get(k))
                 for k, v in channel_specs.items()
             },
             ManagedValueMapping(
@@ -67,11 +66,11 @@ async def AsyncChannelsManager(
     store: Optional[BaseStore] = None,
     *,
     skip_context: bool = False,
-) -> AsyncIterator[Mapping[str, BaseChannel]]:
+) -> AsyncIterator[tuple[Mapping[str, BaseChannel], ManagedValueMapping]]:
     """Manage channels for the lifetime of a Pregel invocation (multiple steps)."""
-    config_for_managed = patch_config(config, configurable={CONFIG_KEY_STORE: store})
-    channel_specs: Mapping[str, BaseChannel] = {}
-    managed_specs: Mapping[str, ManagedValueSpec] = {}
+    config_for_managed = patch_configurable(config, {CONFIG_KEY_STORE: store})
+    channel_specs: dict[str, BaseChannel] = {}
+    managed_specs: dict[str, ManagedValueSpec] = {}
     for k, v in specs.items():
         if isinstance(v, BaseChannel):
             channel_specs[k] = v
@@ -99,11 +98,7 @@ async def AsyncChannelsManager(
         yield (
             # channels: enter each channel with checkpoint
             {
-                k: await stack.enter_async_context(
-                    v.afrom_checkpoint_named(
-                        checkpoint["channel_values"].get(k), config
-                    )
-                )
+                k: v.from_checkpoint(checkpoint["channel_values"].get(k))
                 for k, v in channel_specs.items()
             },
             # managed: build mapping from spec to result

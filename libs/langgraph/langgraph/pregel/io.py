@@ -28,7 +28,7 @@ def read_channel(
 
 def read_channels(
     channels: Mapping[str, BaseChannel],
-    select: Union[list[str], str],
+    select: Union[Sequence[str], str],
     *,
     skip_empty: bool = True,
 ) -> Union[dict[str, Any], Any]:
@@ -97,6 +97,9 @@ class AddableUpdatesDict(AddableDict):
         raise TypeError("AddableUpdatesDict does not support right-side addition")
 
 
+EMPTY_SEQ: tuple[str, ...] = tuple()
+
+
 def map_output_updates(
     output_channels: Union[str, Sequence[str]],
     tasks: list[tuple[PregelExecutableTask, Sequence[tuple[str, Any]]]],
@@ -106,37 +109,38 @@ def map_output_updates(
     output_tasks = [
         (t, ww)
         for t, ww in tasks
-        if (not t.config or TAG_HIDDEN not in t.config.get("tags"))
-        and all(k not in (ERROR, INTERRUPT) for k, _ in ww)
+        if (not t.config or TAG_HIDDEN not in t.config.get("tags", EMPTY_SEQ))
+        and ww[0][0] != ERROR
+        and ww[0][0] != INTERRUPT
     ]
     if not output_tasks:
         return
     if isinstance(output_channels, str):
-        updated = [
+        updated = (
             (task.name, value)
             for task, writes in output_tasks
             for chan, value in writes
             if chan == output_channels
-        ]
+        )
     else:
-        updated = [
+        updated = (
             (
                 task.name,
                 {chan: value for chan, value in task.writes if chan in output_channels},
             )
             for task, writes in output_tasks
             if any(chan in output_channels for chan, _ in writes)
-        ]
-    grouped = {t.name: [] for t, _ in output_tasks}
+        )
+    grouped: dict[str, list[Any]] = {t.name: [] for t, _ in output_tasks}
     for node, value in updated:
         grouped[node].append(value)
     for node, value in grouped.items():
         if len(value) == 0:
-            grouped[node] = None
+            grouped[node] = None  # type: ignore[assignment]
         if len(value) == 1:
             grouped[node] = value[0]
     if cached:
-        grouped["__metadata__"] = {"cached": cached}
+        grouped["__metadata__"] = {"cached": cached}  # type: ignore[assignment]
     yield AddableUpdatesDict(grouped)
 
 

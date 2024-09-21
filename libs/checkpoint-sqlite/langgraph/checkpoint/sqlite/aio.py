@@ -1,11 +1,12 @@
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterator,
-    List,
     Optional,
     Sequence,
     Tuple,
@@ -26,12 +27,13 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.serde.types import ChannelProtocol
 from langgraph.checkpoint.sqlite.utils import search_where
 
-T = TypeVar("T", bound=callable)
+T = TypeVar("T", bound=Callable)
 
 
-class AsyncSqliteSaver(BaseCheckpointSaver):
+class AsyncSqliteSaver(BaseCheckpointSaver[str]):
     """An asynchronous checkpoint saver that stores checkpoints in a SQLite database.
 
     This class provides an asynchronous interface for saving and retrieving checkpoints
@@ -181,7 +183,8 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
         while True:
             try:
                 yield asyncio.run_coroutine_threadsafe(
-                    anext(aiter_), self.loop
+                    anext(aiter_),
+                    self.loop,
                 ).result()
             except StopAsyncIteration:
                 break
@@ -212,7 +215,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
         ).result()
 
     def put_writes(
-        self, config: RunnableConfig, writes: List[Tuple[str, Any]], task_id: str
+        self, config: RunnableConfig, writes: Sequence[Tuple[str, Any]], task_id: str
     ) -> None:
         return asyncio.run_coroutine_threadsafe(
             self.aput_writes(config, writes, task_id), self.loop
@@ -276,7 +279,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
         """
         await self.setup()
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
-        async with self.conn.cursor() as cur:
+        async with self.lock, self.conn.cursor() as cur:
             # find the latest checkpoint for the thread_id
             if checkpoint_id := get_checkpoint_id(config):
                 await cur.execute(
@@ -371,7 +374,9 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
         ORDER BY checkpoint_id DESC"""
         if limit:
             query += f" LIMIT {limit}"
-        async with self.conn.execute(query, params) as cur, self.conn.cursor() as wcur:
+        async with self.lock, self.conn.execute(
+            query, params
+        ) as cur, self.conn.cursor() as wcur:
             async for (
                 thread_id,
                 checkpoint_ns,
@@ -438,7 +443,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
         type_, serialized_checkpoint = self.serde.dumps_typed(checkpoint)
         serialized_metadata = self.jsonplus_serde.dumps(metadata)
-        async with self.conn.execute(
+        async with self.lock, self.conn.execute(
             "INSERT OR REPLACE INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 str(config["configurable"]["thread_id"]),
@@ -474,10 +479,15 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
             writes (Sequence[Tuple[str, Any]]): List of writes to store, each as (channel, value) pair.
             task_id (str): Identifier for the task creating the writes.
         """
+        query = (
+            "INSERT OR REPLACE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            if all(w[0] in WRITES_IDX_MAP for w in writes)
+            else "INSERT OR IGNORE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
         await self.setup()
-        async with self.conn.cursor() as cur:
+        async with self.lock, self.conn.cursor() as cur:
             await cur.executemany(
-                "INSERT OR IGNORE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                query,
                 [
                     (
                         str(config["configurable"]["thread_id"]),
@@ -491,3 +501,25 @@ class AsyncSqliteSaver(BaseCheckpointSaver):
                     for idx, (channel, value) in enumerate(writes)
                 ],
             )
+
+    def get_next_version(self, current: Optional[str], channel: ChannelProtocol) -> str:
+        """Generate the next version ID for a channel.
+
+        This method creates a new version identifier for a channel based on its current version.
+
+        Args:
+            current (Optional[str]): The current version identifier of the channel.
+            channel (BaseChannel): The channel being versioned.
+
+        Returns:
+            str: The next version identifier, which is guaranteed to be monotonically increasing.
+        """
+        if current is None:
+            current_v = 0
+        elif isinstance(current, int):
+            current_v = current
+        else:
+            current_v = int(current.split(".")[0])
+        next_v = current_v + 1
+        next_h = random.random()
+        return f"{next_v:032}.{next_h:016}"

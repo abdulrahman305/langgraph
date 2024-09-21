@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Any, Callable, Literal, NamedTuple, Optional, Type, Union
+from typing import Any, Callable, Literal, NamedTuple, Optional, Sequence, Type, Union
 
 from langchain_core.runnables import Runnable, RunnableConfig
 
@@ -52,7 +52,7 @@ class RetryPolicy(NamedTuple):
     jitter: bool = True
     """Whether to add random jitter to the interval between retries."""
     retry_on: Union[
-        Type[Exception], tuple[Type[Exception], ...], Callable[[Exception], bool]
+        Type[Exception], Sequence[Type[Exception]], Callable[[Exception], bool]
     ] = default_retry_on
     """List of exception classes that should trigger a retry, or a callable that returns True for exceptions that should trigger a retry."""
 
@@ -66,6 +66,7 @@ class CachePolicy(NamedTuple):
 class PregelTask(NamedTuple):
     id: str
     name: str
+    path: tuple[Union[str, int], ...]
     error: Optional[Exception] = None
     interrupts: tuple[Interrupt, ...] = ()
     state: Union[None, RunnableConfig, "StateSnapshot"] = None
@@ -81,6 +82,8 @@ class PregelExecutableTask(NamedTuple):
     retry_policy: Optional[RetryPolicy]
     cache_policy: Optional[CachePolicy]
     id: str
+    path: tuple[Union[str, int], ...]
+    scheduled: bool = False
 
 
 class StateSnapshot(NamedTuple):
@@ -104,11 +107,18 @@ class StateSnapshot(NamedTuple):
 
 All = Literal["*"]
 
-StreamMode = Literal["values", "updates", "debug"]
+StreamMode = Literal["values", "updates", "debug", "messages", "custom"]
 """How the stream method should emit outputs.
 
 - 'values': Emit all values of the state for each step.
 - 'updates': Emit only the node name(s) and updates
     that were returned by the node(s) **after** each step.
 - 'debug': Emit debug events for each step.
+- 'messages': Emit LLM messages token-by-token.
+- 'custom': Emit custom output `write: StreamWriter` kwarg of each node.
 """
+
+StreamWriter = Callable[[Any], None]
+"""Callable that accepts a single argument and writes it to the output stream.
+Always injected into nodes if requested,
+but it's a no-op when not using stream_mode="custom"."""

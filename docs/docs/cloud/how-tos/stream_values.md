@@ -1,6 +1,8 @@
 # How to stream full state of your graph
 
-This guide covers how to use `stream_mode="values"`, which streams the value of the state at each superstep. This differs from using `stream_mode="updates"`: instead of streaming just the updates to the state from each node, it streams the entire graph state at that superstep. Read [this conceptual guide](https://langchain-ai.github.io/langgraph/concepts/low_level/#stream-and-astream) to learn more.```
+This guide covers how to use `stream_mode="values"`, which streams the value of the state at each superstep. This differs from using `stream_mode="updates"`: instead of streaming just the updates to the state from each node, it streams the entire graph state at that superstep. Read [this conceptual guide](https://langchain-ai.github.io/langgraph/concepts/low_level/#stream-and-astream) to learn more.
+
+## Setup
 
 First let's set up our client and thread:
 
@@ -10,6 +12,8 @@ First let's set up our client and thread:
     from langgraph_sdk import get_client
 
     client = get_client(url=<DEPLOYMENT_URL>)
+    # Using the graph deployed with the name "agent"
+    assistant_id = "agent"
     # create thread
     thread = await client.threads.create()
     print(thread)
@@ -21,9 +25,11 @@ First let's set up our client and thread:
     import { Client } from "@langchain/langgraph-sdk";
 
     const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+    // Using the graph deployed with the name "agent"
+    const assistantID = "agent";
     // create thread
     const thread = await client.threads.create();
-    console.log(thread)
+    console.log(thread);
     ```
 
 === "CURL"
@@ -31,29 +37,35 @@ First let's set up our client and thread:
     ```bash
     curl --request POST \
       --url <DEPLOYMENT_URL>/threads \
-      --header 'Content-Type: application/json'
+      --header 'Content-Type: application/json' \
+      --data '{}'
     ```
 
 Output:
 
-    {'thread_id': 'bfc68029-1f7b-400f-beab-6f9032a52da4',
-     'created_at': '2024-06-24T21:30:07.980789+00:00',
-     'updated_at': '2024-06-24T21:30:07.980789+00:00',
-     'metadata': {},
-     'status': 'idle',
-     'config': {}}
+    {
+      'thread_id': 'bfc68029-1f7b-400f-beab-6f9032a52da4',
+      'created_at': '2024-06-24T21:30:07.980789+00:00',
+      'updated_at': '2024-06-24T21:30:07.980789+00:00',
+      'metadata': {},
+      'status': 'idle',
+      'config': {},
+      'values': None
+    }
+
+## Stream graph in values mode
 
 Now we can stream by values, which streams the full state of the graph after each node has finished executing:
 
 === "Python"
 
     ```python
-    input = {"messages": [{"role": "human", "content": "what's the weather in la"}]}
+    input = {"messages": [{"role": "user", "content": "what's the weather in la"}]}
 
     # stream values
     async for chunk in client.runs.stream(
         thread["thread_id"],
-        "agent", 
+        assistant_id, 
         input=input,
         stream_mode="values"
     ):
@@ -65,20 +77,20 @@ Now we can stream by values, which streams the full state of the graph after eac
 === "Javascript"
 
     ```js
-    const input = {"messages": [{"role": "human", "content": "what's the weather in la"}]}
+    const input = {"messages": [{"role": "user", "content": "what's the weather in la"}]}
 
     const streamResponse = client.runs.stream(
       thread["thread_id"],
-      "agent",
+      assistantID,
       {
         input,
         streamMode: "values"
       }
     );
     for await (const chunk of streamResponse) {
-      console.log(f"Receiving new event of type: {chunk.event}...")
-      console.log(chunk.data)
-      console.log("\n\n")
+      console.log(`Receiving new event of type: ${chunk.event}...`);
+      console.log(chunk.data);
+      console.log("\n\n");
     }
     ```
 
@@ -161,7 +173,7 @@ If we want to just get the final result, we can use this endpoint and just keep 
     final_answer = None
     async for chunk in client.runs.stream(
         thread["thread_id"],
-        "agent",
+        assistant_id,
         input=input,
         stream_mode="values"
     ):
@@ -175,7 +187,7 @@ If we want to just get the final result, we can use this endpoint and just keep 
     let finalAnswer;
     const streamResponse = client.runs.stream(
       thread["thread_id"],
-      "agent",
+      assistantID,
       {
         input,
         streamMode: "values"

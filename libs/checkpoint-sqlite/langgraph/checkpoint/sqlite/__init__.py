@@ -1,7 +1,7 @@
+import random
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
-from hashlib import md5
 from typing import Any, AsyncIterator, Dict, Iterator, Optional, Sequence, Tuple
 
 from langchain_core.runnables import RunnableConfig
@@ -13,7 +13,6 @@ from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
-    EmptyChannelError,
     SerializerProtocol,
     get_checkpoint_id,
 )
@@ -32,7 +31,7 @@ _AIO_ERROR_MSG = (
 )
 
 
-class SqliteSaver(BaseCheckpointSaver):
+class SqliteSaver(BaseCheckpointSaver[str]):
     """A checkpoint saver that stores checkpoints in a SQLite database.
 
     Note:
@@ -104,10 +103,12 @@ class SqliteSaver(BaseCheckpointSaver):
                 with SqliteSaver.from_conn_string("checkpoints.sqlite") as memory:
                     ...
         """
-        with sqlite3.connect(
-            conn_string,
-            # https://ricardoanderegg.com/posts/python-sqlite-thread-safety/
-            check_same_thread=False,
+        with closing(
+            sqlite3.connect(
+                conn_string,
+                # https://ricardoanderegg.com/posts/python-sqlite-thread-safety/
+                check_same_thread=False,
+            )
         ) as conn:
             yield SqliteSaver(conn)
 
@@ -163,14 +164,15 @@ class SqliteSaver(BaseCheckpointSaver):
         Yields:
             sqlite3.Cursor: A cursor for the SQLite database.
         """
-        self.setup()
-        cur = self.conn.cursor()
-        try:
-            yield cur
-        finally:
-            if transaction:
-                self.conn.commit()
-            cur.close()
+        with self.lock:
+            self.setup()
+            cur = self.conn.cursor()
+            try:
+                yield cur
+            finally:
+                if transaction:
+                    self.conn.commit()
+                cur.close()
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """Get a checkpoint tuple from the database.
@@ -396,7 +398,7 @@ class SqliteSaver(BaseCheckpointSaver):
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
         type_, serialized_checkpoint = self.serde.dumps_typed(checkpoint)
         serialized_metadata = self.jsonplus_serde.dumps(metadata)
-        with self.lock, self.cursor() as cur:
+        with self.cursor() as cur:
             cur.execute(
                 "INSERT OR REPLACE INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -432,9 +434,14 @@ class SqliteSaver(BaseCheckpointSaver):
             writes (Sequence[Tuple[str, Any]]): List of writes to store, each as (channel, value) pair.
             task_id (str): Identifier for the task creating the writes.
         """
-        with self.lock, self.cursor() as cur:
+        query = (
+            "INSERT OR REPLACE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            if all(w[0] in WRITES_IDX_MAP for w in writes)
+            else "INSERT OR IGNORE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        with self.cursor() as cur:
             cur.executemany(
-                "INSERT OR IGNORE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                query,
                 [
                     (
                         str(config["configurable"]["thread_id"]),
@@ -480,6 +487,7 @@ class SqliteSaver(BaseCheckpointSaver):
         config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Save a checkpoint to the database asynchronously.
 
@@ -503,11 +511,10 @@ class SqliteSaver(BaseCheckpointSaver):
         """
         if current is None:
             current_v = 0
+        elif isinstance(current, int):
+            current_v = current
         else:
             current_v = int(current.split(".")[0])
         next_v = current_v + 1
-        try:
-            next_h = md5(self.serde.dumps_typed(channel.checkpoint())[1]).hexdigest()
-        except EmptyChannelError:
-            next_h = ""
-        return f"{next_v:032}.{next_h}"
+        next_h = random.random()
+        return f"{next_v:032}.{next_h:016}"

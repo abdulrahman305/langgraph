@@ -1,31 +1,49 @@
 from dataclasses import dataclass
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
 INPUT = "__input__"
 CONFIG_KEY_SEND = "__pregel_send"
 CONFIG_KEY_READ = "__pregel_read"
 CONFIG_KEY_CHECKPOINTER = "__pregel_checkpointer"
 CONFIG_KEY_STREAM = "__pregel_stream"
+CONFIG_KEY_STREAM_WRITER = "__pregel_stream_writer"
 CONFIG_KEY_STORE = "__pregel_store"
 CONFIG_KEY_RESUMING = "__pregel_resuming"
 CONFIG_KEY_TASK_ID = "__pregel_task_id"
+CONFIG_KEY_DEDUPE_TASKS = "__pregel_dedupe_tasks"
+CONFIG_KEY_ENSURE_LATEST = "__pregel_ensure_latest"
+CONFIG_KEY_DELEGATE = "__pregel_delegate"
 # this one part of public API so more readable
 CONFIG_KEY_CHECKPOINT_MAP = "checkpoint_map"
 INTERRUPT = "__interrupt__"
 ERROR = "__error__"
-TASKS = "__pregel_tasks"
+NO_WRITES = "__no_writes__"
+SCHEDULED = "__scheduled__"
+TASKS = "__pregel_tasks"  # for backwards compat, this is the original name of PUSH
+PUSH = "__pregel_push"
+PULL = "__pregel_pull"
 RUNTIME_PLACEHOLDER = "__pregel_runtime_placeholder__"
 RESERVED = {
+    SCHEDULED,
     INTERRUPT,
     ERROR,
+    NO_WRITES,
     TASKS,
+    PUSH,
+    PULL,
     CONFIG_KEY_SEND,
     CONFIG_KEY_READ,
     CONFIG_KEY_CHECKPOINTER,
     CONFIG_KEY_CHECKPOINT_MAP,
+    CONFIG_KEY_STREAM,
+    CONFIG_KEY_STREAM_WRITER,
     CONFIG_KEY_STORE,
     CONFIG_KEY_RESUMING,
     CONFIG_KEY_TASK_ID,
+    CONFIG_KEY_DEDUPE_TASKS,
+    CONFIG_KEY_ENSURE_LATEST,
+    CONFIG_KEY_DELEGATE,
     INPUT,
     RUNTIME_PLACEHOLDER,
 }
@@ -36,6 +54,8 @@ END = "__end__"
 
 NS_SEP = "|"
 NS_END = ":"
+
+EMPTY_MAP: Mapping[str, Any] = MappingProxyType({})
 
 
 class Send:

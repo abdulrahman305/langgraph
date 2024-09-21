@@ -1,5 +1,17 @@
+import dataclasses
 import json
-from typing import Annotated, Any, Callable, Dict, List, Optional, Sequence, Type, Union
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import pytest
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -14,11 +26,12 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.pydantic_v1 import BaseModel
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool as dec_tool
-from pydantic import BaseModel as BaseModelV2
+from pydantic import BaseModel
+from pydantic.v1 import BaseModel as BaseModelV1
+from typing_extensions import TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.prebuilt import ToolNode, ValidationNode, create_react_agent
@@ -34,6 +47,9 @@ pytestmark = pytest.mark.anyio
 
 
 class FakeToolCallingModel(BaseChatModel):
+    tool_calls: Optional[list[list[ToolCall]]] = None
+    index: int = 0
+
     def _generate(
         self,
         messages: List[BaseMessage],
@@ -43,7 +59,15 @@ class FakeToolCallingModel(BaseChatModel):
     ) -> ChatResult:
         """Top Level call"""
         messages_string = "-".join([m.content for m in messages])
-        message = AIMessage(content=messages_string, id="0")
+        tool_calls = (
+            self.tool_calls[self.index % len(self.tool_calls)]
+            if self.tool_calls
+            else []
+        )
+        message = AIMessage(
+            content=messages_string, id=str(self.index), tool_calls=tool_calls.copy()
+        )
+        self.index += 1
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     @property
@@ -55,8 +79,6 @@ class FakeToolCallingModel(BaseChatModel):
         tools: Sequence[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, BaseMessage]:
-        if len(tools) > 0:
-            raise ValueError("Not supported yet!")
         return self
 
 
@@ -131,29 +153,35 @@ def test_passing_two_modifiers():
 
 
 def test_system_message_modifier():
-    model = FakeToolCallingModel()
     messages_modifier = SystemMessage(content="Foo")
-    agent_1 = create_react_agent(model, [], messages_modifier=messages_modifier)
-    agent_2 = create_react_agent(model, [], state_modifier=messages_modifier)
+    agent_1 = create_react_agent(
+        FakeToolCallingModel(), [], messages_modifier=messages_modifier
+    )
+    agent_2 = create_react_agent(
+        FakeToolCallingModel(), [], state_modifier=messages_modifier
+    )
     for agent in [agent_1, agent_2]:
         inputs = [HumanMessage("hi?")]
         response = agent.invoke({"messages": inputs})
         expected_response = {
-            "messages": inputs + [AIMessage(content="Foo-hi?", id="0")]
+            "messages": inputs + [AIMessage(content="Foo-hi?", id="0", tool_calls=[])]
         }
         assert response == expected_response
 
 
 def test_system_message_string_modifier():
-    model = FakeToolCallingModel()
     messages_modifier = "Foo"
-    agent_1 = create_react_agent(model, [], messages_modifier=messages_modifier)
-    agent_2 = create_react_agent(model, [], state_modifier=messages_modifier)
+    agent_1 = create_react_agent(
+        FakeToolCallingModel(), [], messages_modifier=messages_modifier
+    )
+    agent_2 = create_react_agent(
+        FakeToolCallingModel(), [], state_modifier=messages_modifier
+    )
     for agent in [agent_1, agent_2]:
         inputs = [HumanMessage("hi?")]
         response = agent.invoke({"messages": inputs})
         expected_response = {
-            "messages": inputs + [AIMessage(content="Foo-hi?", id="0")]
+            "messages": inputs + [AIMessage(content="Foo-hi?", id="0", tool_calls=[])]
         }
         assert response == expected_response
 
@@ -379,7 +407,7 @@ class MyModel(BaseModel):
     some_other_val: str
 
 
-class MyModelV2(BaseModelV2):
+class MyModelV1(BaseModelV1):
     some_val: int
     some_other_val: str
 
@@ -395,7 +423,7 @@ def my_tool(some_val: int, some_other_val: str) -> str:
     [
         my_function,
         MyModel,
-        MyModelV2,
+        MyModelV1,
         my_tool,
     ],
 )
@@ -440,14 +468,53 @@ async def test_validation_node(tool_schema: Any, use_message_key: bool):
     check_results(result_sync)
 
 
-def test_tool_node_inject_state() -> None:
-    def tool1(some_val: int, state: Annotated[dict, InjectedState]) -> str:
-        """Tool 1 docstring."""
-        return state["foo"]
+class _InjectStateSchema(TypedDict):
+    messages: list
+    foo: str
 
-    def tool2(some_val: int, state: Annotated[dict, InjectedState()]) -> str:
+
+class _InjectedStatePydanticSchema(BaseModelV1):
+    messages: list
+    foo: str
+
+
+class _InjectedStatePydanticV2Schema(BaseModel):
+    messages: list
+    foo: str
+
+
+@dataclasses.dataclass
+class _InjectedStateDataclassSchema:
+    messages: list
+    foo: str
+
+
+T = TypeVar("T")
+
+
+@pytest.mark.parametrize(
+    "schema_",
+    [
+        _InjectStateSchema,
+        _InjectedStatePydanticSchema,
+        _InjectedStatePydanticV2Schema,
+        _InjectedStateDataclassSchema,
+    ],
+)
+def test_tool_node_inject_state(schema_: Type[T]) -> None:
+    def tool1(some_val: int, state: Annotated[T, InjectedState]) -> str:
         """Tool 1 docstring."""
-        return state["foo"]
+        if isinstance(state, dict):
+            return state["foo"]
+        else:
+            return getattr(state, "foo")
+
+    def tool2(some_val: int, state: Annotated[T, InjectedState()]) -> str:
+        """Tool 2 docstring."""
+        if isinstance(state, dict):
+            return state["foo"]
+        else:
+            return getattr(state, "foo")
 
     def tool3(
         some_val: int,
@@ -472,23 +539,36 @@ def test_tool_node_inject_state() -> None:
             "type": "tool_call",
         }
         msg = AIMessage("hi?", tool_calls=[tool_call])
-        result = node.invoke({"messages": [msg], "foo": "bar"})
+        result = node.invoke(schema_(**{"messages": [msg], "foo": "bar"}))
         tool_message = result["messages"][-1]
-        assert tool_message.content == "bar"
+        assert tool_message.content == "bar", f"Failed for tool={tool_name}"
 
         if tool_name == "tool3":
-            with pytest.raises(KeyError):
-                node.invoke({"messages": [msg], "notfoo": "bar"})
+            failure_input = None
+            try:
+                failure_input = schema_(**{"messages": [msg], "notfoo": "bar"})
+            except Exception:
+                pass
+            if failure_input is not None:
+                with pytest.raises(KeyError):
+                    node.invoke(failure_input)
 
-            with pytest.raises(ValueError):
-                node.invoke([msg])
+                with pytest.raises(ValueError):
+                    node.invoke([msg])
         else:
-            tool_message = node.invoke({"messages": [msg], "notfoo": "bar"})[
-                "messages"
-            ][-1]
-            assert "KeyError" in tool_message.content
-            tool_message = node.invoke([msg])[-1]
-            assert "KeyError" in tool_message.content
+            failure_input = None
+            try:
+                failure_input = schema_(**{"messages": [msg], "notfoo": "bar"})
+            except Exception:
+                # We'd get a validation error from pydantic state and wouldn't make it to the node
+                # anyway
+                pass
+            if failure_input is not None:
+                messages_ = node.invoke(failure_input)
+                tool_message = messages_["messages"][-1]
+                assert "KeyError" in tool_message.content
+                tool_message = node.invoke([msg])[-1]
+                assert "KeyError" in tool_message.content
 
     tool_call = {
         "name": "tool4",
@@ -497,7 +577,7 @@ def test_tool_node_inject_state() -> None:
         "type": "tool_call",
     }
     msg = AIMessage("hi?", tool_calls=[tool_call])
-    result = node.invoke({"messages": [msg]})
+    result = node.invoke(schema_(**{"messages": [msg], "foo": ""}))
     tool_message = result["messages"][-1]
     assert tool_message.content == "hi?"
 
@@ -519,3 +599,100 @@ def test_tool_node_ensure_utf8() -> None:
         [AIMessage(content="", tool_calls=tool_calls)]
     )
     assert outputs[0].content == json.dumps(data, ensure_ascii=False)
+
+
+async def test_return_direct() -> None:
+    @dec_tool(return_direct=True)
+    def tool_return_direct(input: str) -> str:
+        """A tool that returns directly."""
+        return f"Direct result: {input}"
+
+    @dec_tool
+    def tool_normal(input: str) -> str:
+        """A normal tool."""
+        return f"Normal result: {input}"
+
+    first_tool_call = [
+        ToolCall(
+            name="tool_return_direct",
+            args={"input": "Test direct"},
+            id="1",
+        ),
+    ]
+    expected_ai = AIMessage(
+        content="Test direct",
+        id="0",
+        tool_calls=first_tool_call,
+    )
+    model = FakeToolCallingModel(tool_calls=[first_tool_call, []])
+    agent = create_react_agent(model, [tool_return_direct, tool_normal])
+
+    # Test direct return for tool_return_direct
+    result = agent.invoke(
+        {"messages": [HumanMessage(content="Test direct", id="hum0")]}
+    )
+    assert result["messages"] == [
+        HumanMessage(content="Test direct", id="hum0"),
+        expected_ai,
+        ToolMessage(
+            content="Direct result: Test direct",
+            name="tool_return_direct",
+            tool_call_id="1",
+            id=result["messages"][2].id,
+        ),
+    ]
+    second_tool_call = [
+        ToolCall(
+            name="tool_normal",
+            args={"input": "Test normal"},
+            id="2",
+        ),
+    ]
+    model = FakeToolCallingModel(tool_calls=[second_tool_call, []])
+    agent = create_react_agent(model, [tool_return_direct, tool_normal])
+    result = agent.invoke(
+        {"messages": [HumanMessage(content="Test normal", id="hum1")]}
+    )
+    assert result["messages"] == [
+        HumanMessage(content="Test normal", id="hum1"),
+        AIMessage(content="Test normal", id="0", tool_calls=second_tool_call),
+        ToolMessage(
+            content="Normal result: Test normal",
+            name="tool_normal",
+            tool_call_id="2",
+            id=result["messages"][2].id,
+        ),
+        AIMessage(content="Test normal-Test normal-Normal result: Test normal", id="1"),
+    ]
+
+    both_tool_calls = [
+        ToolCall(
+            name="tool_return_direct",
+            args={"input": "Test both direct"},
+            id="3",
+        ),
+        ToolCall(
+            name="tool_normal",
+            args={"input": "Test both normal"},
+            id="4",
+        ),
+    ]
+    model = FakeToolCallingModel(tool_calls=[both_tool_calls, []])
+    agent = create_react_agent(model, [tool_return_direct, tool_normal])
+    result = agent.invoke({"messages": [HumanMessage(content="Test both", id="hum2")]})
+    assert result["messages"] == [
+        HumanMessage(content="Test both", id="hum2"),
+        AIMessage(content="Test both", id="0", tool_calls=both_tool_calls),
+        ToolMessage(
+            content="Direct result: Test both direct",
+            name="tool_return_direct",
+            tool_call_id="3",
+            id=result["messages"][2].id,
+        ),
+        ToolMessage(
+            content="Normal result: Test both normal",
+            name="tool_normal",
+            tool_call_id="4",
+            id=result["messages"][3].id,
+        ),
+    ]

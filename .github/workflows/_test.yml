@@ -21,6 +21,7 @@ jobs:
           - "3.10"
           - "3.11"
           - "3.12"
+
     name: "test #${{ matrix.python-version }}"
     steps:
       - uses: actions/checkout@v4
@@ -30,14 +31,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           poetry-version: ${{ env.POETRY_VERSION }}
           working-directory: ${{ inputs.working-directory }}
-          cache-key: core
+          cache-key: test-${{ inputs.working-directory }}
 
       - name: Install dependencies
         shell: bash
         working-directory: ${{ inputs.working-directory }}
-        run: poetry install --with dev
+        run: |
+          poetry install --with dev
 
-      - name: Run core tests
+      - name: Run tests
         shell: bash
         working-directory: ${{ inputs.working-directory }}
         run: |

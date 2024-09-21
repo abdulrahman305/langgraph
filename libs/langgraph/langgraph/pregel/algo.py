@@ -1,9 +1,10 @@
-import json
 from collections import defaultdict, deque
 from functools import partial
+from hashlib import sha1
 from typing import (
     Any,
     Callable,
+    Iterable,
     Iterator,
     Literal,
     Mapping,
@@ -14,31 +15,30 @@ from typing import (
     Union,
     overload,
 )
-from uuid import UUID, uuid5
+from uuid import UUID
 
 from langchain_core.callbacks.manager import AsyncParentRunManager, ParentRunManager
-from langchain_core.runnables.config import (
-    RunnableConfig,
-    merge_configs,
-    patch_config,
-)
+from langchain_core.runnables.config import RunnableConfig
 
 from langgraph.channels.base import BaseChannel
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
     Checkpoint,
+    V,
     copy_checkpoint,
-    create_checkpoint,
 )
 from langgraph.constants import (
     CONFIG_KEY_CHECKPOINT_MAP,
     CONFIG_KEY_CHECKPOINTER,
     CONFIG_KEY_READ,
-    CONFIG_KEY_RESUMING,
     CONFIG_KEY_SEND,
     CONFIG_KEY_TASK_ID,
     INTERRUPT,
+    NO_WRITES,
+    NS_END,
     NS_SEP,
+    PULL,
+    PUSH,
     RESERVED,
     TAG_HIDDEN,
     TASKS,
@@ -51,12 +51,22 @@ from langgraph.pregel.log import logger
 from langgraph.pregel.manager import ChannelsManager
 from langgraph.pregel.read import PregelNode
 from langgraph.pregel.types import All, PregelExecutableTask, PregelTask
+from langgraph.utils.config import merge_configs, patch_config
+
+GetNextVersion = Callable[[Optional[V], BaseChannel], V]
+
+EMPTY_SEQ: tuple[str, ...] = tuple()
 
 
 class WritesProtocol(Protocol):
-    name: str
-    writes: Sequence[tuple[str, Any]]
-    triggers: Sequence[str]
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def writes(self) -> Sequence[tuple[str, Any]]: ...
+
+    @property
+    def triggers(self) -> Sequence[str]: ...
 
 
 class PregelTaskWrites(NamedTuple):
@@ -68,14 +78,14 @@ class PregelTaskWrites(NamedTuple):
 def should_interrupt(
     checkpoint: Checkpoint,
     interrupt_nodes: Union[All, Sequence[str]],
-    tasks: list[PregelExecutableTask],
+    tasks: Iterable[PregelExecutableTask],
 ) -> list[PregelExecutableTask]:
     version_type = type(next(iter(checkpoint["channel_versions"].values()), None))
-    null_version = version_type()
+    null_version = version_type()  # type: ignore[misc]
     seen = checkpoint["versions_seen"].get(INTERRUPT, {})
     # interrupt if any channel has been updated since last interrupt
     any_updates_since_prev_interrupt = any(
-        version > seen.get(chan, null_version)
+        version > seen.get(chan, null_version)  # type: ignore[operator]
         for chan, version in checkpoint["channel_versions"].items()
     )
     # and any triggered node is in interrupt_nodes list
@@ -84,7 +94,10 @@ def should_interrupt(
             task
             for task in tasks
             if (
-                (not task.config or TAG_HIDDEN not in task.config.get("tags"))
+                (
+                    not task.config
+                    or TAG_HIDDEN not in task.config.get("tags", EMPTY_SEQ)
+                )
                 if interrupt_nodes == "*"
                 else task.name in interrupt_nodes
             )
@@ -106,17 +119,25 @@ def local_read(
 ) -> Union[dict[str, Any], Any]:
     if isinstance(select, str):
         managed_keys = []
+        for c, _ in task.writes:
+            if c == select:
+                updated = {c}
+                break
+        else:
+            updated = set()
     else:
         managed_keys = [k for k in select if k in managed]
         select = [k for k in select if k not in managed]
-    if fresh:
-        new_checkpoint = create_checkpoint(copy_checkpoint(checkpoint), channels, -1)
-        with ChannelsManager(channels, new_checkpoint, config, skip_context=True) as (
-            channels,
-            _,
-        ):
-            apply_writes(new_checkpoint, channels, [task], None)
-            values = read_channels(channels, select)
+        updated = set(select).intersection(c for c, _ in task.writes)
+    if fresh and updated:
+        with ChannelsManager(
+            {k: v for k, v in channels.items() if k in updated},
+            checkpoint,
+            config,
+            skip_context=True,
+        ) as (local_channels, _):
+            apply_writes(copy_checkpoint(checkpoint), local_channels, [task], None)
+            values = read_channels({**channels, **local_channels}, select)
     else:
         values = read_channels(channels, select)
     if managed_keys:
@@ -154,8 +175,8 @@ def increment(current: Optional[int], channel: BaseChannel) -> int:
 def apply_writes(
     checkpoint: Checkpoint,
     channels: Mapping[str, BaseChannel],
-    tasks: Sequence[WritesProtocol],
-    get_next_version: Optional[Callable[[int, BaseChannel], int]],
+    tasks: Iterable[WritesProtocol],
+    get_next_version: Optional[GetNextVersion],
 ) -> dict[str, list[Any]]:
     # update seen versions
     for task in tasks:
@@ -175,13 +196,16 @@ def apply_writes(
 
     # Consume all channels that were read
     for chan in {
-        chan for task in tasks for chan in task.triggers if chan not in RESERVED
+        chan
+        for task in tasks
+        for chan in task.triggers
+        if chan not in RESERVED and chan in channels
     }:
-        if channels[chan].consume():
-            if get_next_version is not None:
-                checkpoint["channel_versions"][chan] = get_next_version(
-                    max_version, channels[chan]
-                )
+        if channels[chan].consume() and get_next_version is not None:
+            checkpoint["channel_versions"][chan] = get_next_version(
+                max_version,
+                channels[chan],
+            )
 
     # clear pending sends
     if checkpoint["pending_sends"]:
@@ -192,7 +216,9 @@ def apply_writes(
     pending_writes_by_managed: dict[str, list[Any]] = defaultdict(list)
     for task in tasks:
         for chan, val in task.writes:
-            if chan == TASKS:
+            if chan == NO_WRITES:
+                pass
+            elif chan == TASKS:
                 checkpoint["pending_sends"].append(val)
             elif chan in channels:
                 pending_writes_by_channel[chan].append(val)
@@ -209,10 +235,10 @@ def apply_writes(
     updated_channels: set[str] = set()
     for chan, vals in pending_writes_by_channel.items():
         if chan in channels:
-            updated = channels[chan].update(vals)
-            if updated and get_next_version is not None:
+            if channels[chan].update(vals) and get_next_version is not None:
                 checkpoint["channel_versions"][chan] = get_next_version(
-                    max_version, channels[chan]
+                    max_version,
+                    channels[chan],
                 )
             updated_channels.add(chan)
 
@@ -221,7 +247,8 @@ def apply_writes(
         if chan not in updated_channels:
             if channels[chan].update([]) and get_next_version is not None:
                 checkpoint["channel_versions"][chan] = get_next_version(
-                    max_version, channels[chan]
+                    max_version,
+                    channels[chan],
                 )
 
     # Return managed values writes to be applied externally
@@ -238,10 +265,9 @@ def prepare_next_tasks(
     step: int,
     *,
     for_execution: Literal[False],
-    is_resuming: bool = False,
     checkpointer: Literal[None] = None,
     manager: Literal[None] = None,
-) -> list[PregelTask]: ...
+) -> dict[str, PregelTask]: ...
 
 
 @overload
@@ -254,10 +280,9 @@ def prepare_next_tasks(
     step: int,
     *,
     for_execution: Literal[True],
-    is_resuming: bool,
     checkpointer: Optional[BaseCheckpointSaver],
     manager: Union[None, ParentRunManager, AsyncParentRunManager],
-) -> list[PregelExecutableTask]: ...
+) -> dict[str, PregelExecutableTask]: ...
 
 
 def prepare_next_tasks(
@@ -269,54 +294,225 @@ def prepare_next_tasks(
     step: int,
     *,
     for_execution: bool,
-    is_resuming: bool = False,
     checkpointer: Optional[BaseCheckpointSaver] = None,
     manager: Union[None, ParentRunManager, AsyncParentRunManager] = None,
-) -> Union[list[PregelTask], list[PregelExecutableTask]]:
+) -> Union[dict[str, PregelTask], dict[str, PregelExecutableTask]]:
+    tasks: dict[str, Union[PregelTask, PregelExecutableTask]] = {}
+    # Consume pending packets
+    for idx, _ in enumerate(checkpoint["pending_sends"]):
+        if task := prepare_single_task(
+            (PUSH, idx),
+            None,
+            checkpoint=checkpoint,
+            processes=processes,
+            channels=channels,
+            managed=managed,
+            config=config,
+            step=step,
+            for_execution=for_execution,
+            checkpointer=checkpointer,
+            manager=manager,
+        ):
+            tasks[task.id] = task
+    # Check if any processes should be run in next step
+    # If so, prepare the values to be passed to them
+    for name in processes:
+        if task := prepare_single_task(
+            (PULL, name),
+            None,
+            checkpoint=checkpoint,
+            processes=processes,
+            channels=channels,
+            managed=managed,
+            config=config,
+            step=step,
+            for_execution=for_execution,
+            checkpointer=checkpointer,
+            manager=manager,
+        ):
+            tasks[task.id] = task
+    return tasks
+
+
+def prepare_single_task(
+    task_path: tuple[str, Union[int, str]],
+    task_id_checksum: Optional[str],
+    *,
+    checkpoint: Checkpoint,
+    processes: Mapping[str, PregelNode],
+    channels: Mapping[str, BaseChannel],
+    managed: ManagedValueMapping,
+    config: RunnableConfig,
+    step: int,
+    for_execution: bool,
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+    manager: Union[None, ParentRunManager, AsyncParentRunManager] = None,
+) -> Union[None, PregelTask, PregelExecutableTask]:
+    checkpoint_id = UUID(checkpoint["id"]).bytes
     configurable = config.get("configurable", {})
     parent_ns = configurable.get("checkpoint_ns", "")
-    tasks: Union[list[PregelTask], list[PregelExecutableTask]] = []
-    # Consume pending packets
-    for packet in checkpoint["pending_sends"]:
+
+    if task_path[0] == PUSH:
+        idx = int(task_path[1])
+        if idx >= len(checkpoint["pending_sends"]):
+            return
+        packet = checkpoint["pending_sends"][idx]
         if not isinstance(packet, Send):
-            logger.warn(f"Ignoring invalid packet type {type(packet)} in pending sends")
-            continue
+            logger.warning(
+                f"Ignoring invalid packet type {type(packet)} in pending sends"
+            )
+            return
         if packet.node not in processes:
-            logger.warn(f"Ignoring unknown node name {packet.node} in pending sends")
-            continue
+            logger.warning(f"Ignoring unknown node name {packet.node} in pending sends")
+            return
         # create task id
-        triggers = [TASKS]
+        triggers = [PUSH]
+        checkpoint_ns = (
+            f"{parent_ns}{NS_SEP}{packet.node}" if parent_ns else packet.node
+        )
+        task_id = _uuid5_str(
+            checkpoint_id,
+            checkpoint_ns,
+            str(step),
+            packet.node,
+            PUSH,
+            str(idx),
+        )
+        task_checkpoint_ns = f"{checkpoint_ns}:{task_id}"
         metadata = {
             "langgraph_step": step,
             "langgraph_node": packet.node,
             "langgraph_triggers": triggers,
-            "langgraph_task_idx": len(tasks),
+            "langgraph_path": task_path,
+            "langgraph_checkpoint_ns": task_checkpoint_ns,
         }
-        checkpoint_ns = (
-            f"{parent_ns}{NS_SEP}{packet.node}" if parent_ns else packet.node
-        )
-        task_id = str(
-            uuid5(UUID(checkpoint["id"]), json.dumps((checkpoint_ns, metadata)))
-        )
+        if task_id_checksum is not None:
+            assert task_id == task_id_checksum
         if for_execution:
             proc = processes[packet.node]
-            if node := proc.get_node():
+            if node := proc.node:
                 managed.replace_runtime_placeholders(step, packet.arg)
-                writes = deque()
-                task_checkpoint_ns = f"{checkpoint_ns}:{task_id}"
-                tasks.append(
-                    PregelExecutableTask(
-                        packet.node,
-                        packet.arg,
+                if proc.metadata:
+                    metadata.update(proc.metadata)
+                writes: deque[tuple[str, Any]] = deque()
+                return PregelExecutableTask(
+                    packet.node,
+                    packet.arg,
+                    node,
+                    writes,
+                    patch_config(
+                        merge_configs(
+                            config, {"metadata": metadata, "tags": proc.tags}
+                        ),
+                        run_name=packet.node,
+                        callbacks=(
+                            manager.get_child(f"graph:step:{step}") if manager else None
+                        ),
+                        configurable={
+                            CONFIG_KEY_TASK_ID: task_id,
+                            # deque.extend is thread-safe
+                            CONFIG_KEY_SEND: partial(
+                                local_write,
+                                step,
+                                writes.extend,
+                                processes,
+                                channels,
+                                managed,
+                            ),
+                            CONFIG_KEY_READ: partial(
+                                local_read,
+                                step,
+                                checkpoint,
+                                channels,
+                                managed,
+                                PregelTaskWrites(packet.node, writes, triggers),
+                                config,
+                            ),
+                            CONFIG_KEY_CHECKPOINTER: (
+                                checkpointer
+                                or configurable.get(CONFIG_KEY_CHECKPOINTER)
+                            ),
+                            CONFIG_KEY_CHECKPOINT_MAP: {
+                                **configurable.get(CONFIG_KEY_CHECKPOINT_MAP, {}),
+                                parent_ns: checkpoint["id"],
+                            },
+                            "checkpoint_id": None,
+                            "checkpoint_ns": task_checkpoint_ns,
+                        },
+                    ),
+                    triggers,
+                    proc.retry_policy,
+                    None,
+                    task_id,
+                    task_path,
+                )
+
+        else:
+            return PregelTask(task_id, packet.node, task_path)
+    elif task_path[0] == PULL:
+        name = str(task_path[1])
+        if name not in processes:
+            return
+        proc = processes[name]
+        version_type = type(next(iter(checkpoint["channel_versions"].values()), None))
+        null_version = version_type()  # type: ignore[misc]
+        if null_version is None:
+            return
+        seen = checkpoint["versions_seen"].get(name, {})
+        # If any of the channels read by this process were updated
+        if triggers := sorted(
+            chan
+            for chan in proc.triggers
+            if not isinstance(
+                read_channel(channels, chan, return_exception=True), EmptyChannelError
+            )
+            and checkpoint["channel_versions"].get(chan, null_version)  # type: ignore[operator]
+            > seen.get(chan, null_version)
+        ):
+            try:
+                val = next(
+                    _proc_input(
+                        step, proc, managed, channels, for_execution=for_execution
+                    )
+                )
+            except StopIteration:
+                return
+
+            # create task id
+            checkpoint_ns = f"{parent_ns}{NS_SEP}{name}" if parent_ns else name
+            task_id = _uuid5_str(
+                checkpoint_id,
+                checkpoint_ns,
+                str(step),
+                name,
+                PULL,
+                *triggers,
+            )
+            task_checkpoint_ns = f"{checkpoint_ns}{NS_END}{task_id}"
+            metadata = {
+                "langgraph_step": step,
+                "langgraph_node": name,
+                "langgraph_triggers": triggers,
+                "langgraph_path": task_path,
+                "langgraph_checkpoint_ns": task_checkpoint_ns,
+            }
+            if task_id_checksum is not None:
+                assert task_id == task_id_checksum
+            if for_execution:
+                if node := proc.node:
+                    if proc.metadata:
+                        metadata.update(proc.metadata)
+                    writes = deque()
+                    return PregelExecutableTask(
+                        name,
+                        val,
                         node,
                         writes,
                         patch_config(
                             merge_configs(
-                                config,
-                                processes[packet.node].config,
-                                {"metadata": metadata},
+                                config, {"metadata": metadata, "tags": proc.tags}
                             ),
-                            run_name=packet.node,
+                            run_name=name,
                             callbacks=(
                                 manager.get_child(f"graph:step:{step}")
                                 if manager
@@ -339,7 +535,7 @@ def prepare_next_tasks(
                                     checkpoint,
                                     channels,
                                     managed,
-                                    PregelTaskWrites(packet.node, writes, triggers),
+                                    PregelTaskWrites(name, writes, triggers),
                                     config,
                                 ),
                                 CONFIG_KEY_CHECKPOINTER: (
@@ -350,7 +546,6 @@ def prepare_next_tasks(
                                     **configurable.get(CONFIG_KEY_CHECKPOINT_MAP, {}),
                                     parent_ns: checkpoint["id"],
                                 },
-                                CONFIG_KEY_RESUMING: is_resuming,
                                 "checkpoint_id": None,
                                 "checkpoint_ns": task_checkpoint_ns,
                             },
@@ -359,117 +554,10 @@ def prepare_next_tasks(
                         proc.retry_policy,
                         None,
                         task_id,
-                    )
-                )
-        else:
-            tasks.append(PregelTask(task_id, packet.node))
-    # Check if any processes should be run in next step
-    # If so, prepare the values to be passed to them
-    version_type = type(next(iter(checkpoint["channel_versions"].values()), None))
-    null_version = version_type()
-    if null_version is None:
-        return tasks
-    for name, proc in processes.items():
-        seen = checkpoint["versions_seen"].get(name, {})
-        # If any of the channels read by this process were updated
-        if triggers := sorted(
-            chan
-            for chan in proc.triggers
-            if not isinstance(
-                read_channel(channels, chan, return_exception=True), EmptyChannelError
-            )
-            and checkpoint["channel_versions"].get(chan, null_version)
-            > seen.get(chan, null_version)
-        ):
-            try:
-                val = next(
-                    _proc_input(
-                        step, proc, managed, channels, for_execution=for_execution
-                    )
-                )
-            except StopIteration:
-                continue
-
-            # create task id
-            metadata = {
-                "langgraph_step": step,
-                "langgraph_node": name,
-                "langgraph_triggers": triggers,
-                "langgraph_task_idx": len(tasks),
-            }
-            checkpoint_ns = f"{parent_ns}{NS_SEP}{name}" if parent_ns else name
-            task_id = str(
-                uuid5(
-                    UUID(checkpoint["id"]),
-                    json.dumps((checkpoint_ns, metadata)),
-                )
-            )
-
-            if for_execution:
-                if node := proc.get_node():
-                    writes = deque()
-                    task_checkpoint_ns = f"{checkpoint_ns}:{task_id}"
-                    tasks.append(
-                        PregelExecutableTask(
-                            name,
-                            val,
-                            node,
-                            writes,
-                            patch_config(
-                                merge_configs(
-                                    config,
-                                    proc.config,
-                                    {"metadata": metadata},
-                                ),
-                                run_name=name,
-                                callbacks=(
-                                    manager.get_child(f"graph:step:{step}")
-                                    if manager
-                                    else None
-                                ),
-                                configurable={
-                                    CONFIG_KEY_TASK_ID: task_id,
-                                    # deque.extend is thread-safe
-                                    CONFIG_KEY_SEND: partial(
-                                        local_write,
-                                        step,
-                                        writes.extend,
-                                        processes,
-                                        channels,
-                                        managed,
-                                    ),
-                                    CONFIG_KEY_READ: partial(
-                                        local_read,
-                                        step,
-                                        checkpoint,
-                                        channels,
-                                        managed,
-                                        PregelTaskWrites(name, writes, triggers),
-                                        config,
-                                    ),
-                                    CONFIG_KEY_CHECKPOINTER: (
-                                        checkpointer
-                                        or configurable.get(CONFIG_KEY_CHECKPOINTER)
-                                    ),
-                                    CONFIG_KEY_CHECKPOINT_MAP: {
-                                        **configurable.get(
-                                            CONFIG_KEY_CHECKPOINT_MAP, {}
-                                        ),
-                                        parent_ns: checkpoint["id"],
-                                    },
-                                    CONFIG_KEY_RESUMING: is_resuming,
-                                    "checkpoint_ns": task_checkpoint_ns,
-                                },
-                            ),
-                            triggers,
-                            proc.retry_policy,
-                            None,
-                            task_id,
-                        )
+                        task_path,
                     )
             else:
-                tasks.append(PregelTask(task_id, name))
-    return tasks
+                return PregelTask(task_id, name, task_path)
 
 
 def _proc_input(
@@ -516,3 +604,12 @@ def _proc_input(
         val = proc.mapper(val)
 
     yield val
+
+
+def _uuid5_str(namespace: bytes, *parts: str) -> str:
+    """Generate a UUID from the SHA-1 hash of a namespace UUID and a name."""
+
+    sha = sha1(namespace, usedforsecurity=False)
+    sha.update(b"".join(p.encode() for p in parts))
+    hex = sha.hexdigest()
+    return f"{hex[:8]}-{hex[8:12]}-{hex[12:16]}-{hex[16:20]}-{hex[20:32]}"
